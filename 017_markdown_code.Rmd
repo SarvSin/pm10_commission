@@ -1,0 +1,1275 @@
+---
+title: "pollution_commission"
+author: "Sarveshwari Singh"
+date: "29/03/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Pre-processing
+
+Loading the data and summarising the datasets for two monitoring locations, Bexley and Hounslow - 
+
+```{r}
+data1 <- read.csv('/Users/sarveshwarisingh/Desktop/017 things/London_Pollution.csv')
+summary(data1)
+```
+
+There are a total of 1827 observations across the 5 year monitoring period. PM10 pollution in Hounslow is higher in both range and mean. The total number of missing values in Bexley and Hounslow are 214 and 326 respectively. 
+
+Inspecting the missing data patterns with respect to year - 
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(magrittr)
+
+Bexley_pattern <- data1%>%
+  group_by('Year' = year(Date))%>%
+  summarise('Bexley NAs' = sum(is.na(Bexley)))
+Bexley_pattern
+
+Hounslow_pattern <- data1%>%
+  group_by('Year' = year(Date))%>%
+  summarise('Houslow NAs' = sum(is.na(Hounslow)))
+Hounslow_pattern
+```
+
+There is an anomalous spike of missing data in Bexley in the year 2001. On other years the missing data remain relatively low. 
+
+Beginning in 2002 there appears to be a small but steady increase in missing data in Bexley. This is reversed in Hounslow, with NAs falling from 109 to 10 by 2004. The sharp rise in missing data between 2001 and 2002 however is to be noted. 
+
+## Visualising
+
+Plotting the PM10 measurements against time for the two sites - 
+
+```{r}
+library(ggplot2)
+library(tidyr)
+
+bexley_bar <- data.frame(date = data1$Date, bexley = replace_na(data1$Bexley, 72))
+
+myplot.p <- ggplot(bexley_bar, aes(x = date, y = bexley, fill = bexley == 72))
+myplot.p + geom_bar(stat = 'identity') +
+   scale_fill_manual(values = c("firebrick","lightblue"), labels=c("Observed", "Missing"))+
+  theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("PM10 in Bexley") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+```{r}
+hounslow_bar <- data.frame(date = data1$Date, hounslow = replace_na(data1$Hounslow, 98))
+
+myplot.pp <- ggplot(hounslow_bar, aes(x = date, y = hounslow, fill = hounslow == 98))
+myplot.pp + geom_bar(stat = 'identity') +
+  scale_fill_manual(values = c("firebrick","lightblue"), labels=c("Observed", "Missing"))+
+  theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("PM10 in Hounslow") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+
+## Initial validation
+
+```{r}
+library(rgdal)
+library(sp)
+
+data.shape<-readOGR(dsn="/Users/sarveshwarisingh/Desktop/017 things/shapefiles")
+#crs(data.shape)
+#glimpse(data.shape)
+```
+
+```{r}
+library(broom)
+
+data.shape_tidy <- tidy(data.shape)
+ggplot(data.shape_tidy, aes(x = long, y = lat, group = group)) +
+  geom_polygon(color = "black", size = 0.1, fill = "honeydew") +
+  coord_equal() +
+  theme_minimal()+
+  geom_point(mapping=aes(x=551862,y= 176380, col='Bexley'))+
+  geom_point(mapping=aes(x=521070,y= 178480, col='Hounslow'))+
+   theme(legend.title = element_blank(), 
+        panel.background = element_blank(), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("Plot of monitoring locations in London") +
+  xlab("Longitude") + ylab("Latitude")
+```
+
+Hounslow is one of the 12 metropolitan centres in Greater London, and is considered the centre of economic activity in West London. Bexley, on the other hand, lies on the outskirts of London and has relatively larger open areas. Road transport is a significant source of PM10. Considering that three major roads pass through Hounslow - the Great West road, the South West road, and the Bath road, whereas  The Unsurprisingly, PM10 values in Hounslow are higher overall compared to measurements obtained in Bexley. 
+
+## Data preparation and missing data treatment
+
+Estimation of missing PM10 data will be carried out, and models for prediction of PM10 pollution in the future will be configured in the following analysis. 
+
+Firstly, the (Bexley) data to be input into the BUGS model is prepared. Observations of pollution are extracted from the dataset. 
+
+```{r}
+# Bexley data prep
+dec13 <- data1[1:1461,]
+
+Bex.dat <- dec13$Bexley
+Bex.dat_re <- Bex.dat[-1]
+Bexley <- Bex.dat_re
+
+```
+
+The missing data for periods noted above will need to be imputed. This will be done by specifying stochastic nodes without data values. JAGS will automatically predict this data. 
+
+Since these nodes are stochastic, they are initialised in the JAGS model. Vectors are created to include NAs for all the known, observed values that are monitored together with the 'predicted' data in the missing periods. 
+
+Two chains are created to assess robustness of the models. Initialised values for the missing data in one chain is the mean of pollution data observed in Bexley from 2000 to 2004. In the second chain, the median of the same is used.  
+
+```{r}
+# Using mean to initialise missing pollution data
+bex.init1 <- Bex.dat
+bex.init1[is.na(bex.init1)] <- mean(bex.init1, na.rm=TRUE)
+
+
+bex.init1[bex.init1!=mean(bex.init1, na.rm=TRUE)] <- NA
+#bex.init1
+
+bex.init1_re <- bex.init1[-1]
+
+# Using median to initialise missing pollution data
+bex.init2 <- Bex.dat
+bex.init2[is.na(bex.init2)] <- median(bex.init2, na.rm=TRUE)
+
+
+bex.init2[bex.init2!=median(bex.init2, na.rm=TRUE)] <- NA
+#bex.init2
+
+bex.init2_re <- bex.init2[-1]
+bex.init2_re[32] <- NA
+
+
+```
+
+Since median is being used to initialise missing values in one chain, a complication arises - this precise value is observed in time periods where the algorithm fails to replace the value with NA. This is corrected - 
+
+```{r}
+# corrections
+bex.init2_re[32] <- NA
+bex.init2_re[253] <- NA
+bex.init2_re[258] <- NA
+bex.init2_re[326] <- NA
+bex.init2_re[475] <- NA
+bex.init2_re[748] <- NA
+bex.init2_re[752] <- NA
+bex.init2_re[923] <- NA
+bex.init2_re[1237] <- NA
+```
+
+Following this, initialisation process for the other stochastic variable - the true value of the underlying process, Y, is creaated - 
+
+For this, a random uniform distribution centred around 20 will be used for all data.  
+
+```{r}
+y_init <- runif(1460, 18, 22)
+length(y_init)
+
+N <- length(Bex.dat_re)
+N
+```
+
+Considering the random walk model suggested in the question, 
+
+$$ Bexley_{t} \sim N(Y_{t}, \sigma_{v}^2)$$  
+$$Y_{t} \sim N(Y_{t-1}, \sigma_{w}^2)$$
+JAGS model is written as follows - 
+
+```{r}
+library(R2jags)
+library(coda)
+library(lattice)
+library(MCMCvis)
+library(tidyverse)
+
+# JAGS model function 
+jags.mod <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+for (i in 2 : N) {
+Bexley[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(Y[i-1], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data <- list('Bexley', 'N')
+
+# Parameters to monitor
+jags.param <- c('Y', 'tau.v', 'tau.w')
+
+# Specifying initial values
+inits1 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Bexley'=bex.init1_re)
+inits2 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Bexley'=bex.init2_re)
+
+jags.inits <- list(inits1, inits2)
+
+# Fitting the model
+jags.mod.fit <- jags(data = jags.data, inits = jags.inits,
+parameters.to.save = jags.param, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod,DIC=FALSE)
+```
+
+The parameters that have been monitored are the priors, variance of the white noise process, $$\sigma_{w}^2$$, variance of measurement error $$\sigma_{v}^2$$, and finally an estimation of the mean of the true underlying process, $$Y_{t}$$. 
+
+The means for missing data will be automatically estimated by JAGS. 
+
+This model fit is converted into an MCMC object for better visualisation of the convergence of chains. 
+
+This convergence is especially important as it allows for testing the robustness of model. If the chains are observed to have converged, this would imply that the target distribution (posterior distribution for parameters) has been reached by the Markov chain. 
+
+Firstly, a visual inspection of the traceplots of select parameters is carried out. Bexley had a significant chunk of missing pollution data in 2001; observation 689 is one of the data that was sandwiched between at least 30 missing data points. Hence, JAGS would have had to predict a value with much weightage on priors and previous noisy predictions as opposed to actual observation. This parameter is selected for analysis. Secondly, there are fewer points of missing observations across the years; one of these, observation 40 is inspected in addition to other priors - the variances of the noise and errors. 
+
+
+```{r}
+jagsfit.mcmc <- as.mcmc(jags.mod.fit)
+MCMCtrace(jagsfit.mcmc,type = 'trace',ind = TRUE, pdf = FALSE, params=c( "Y[689]","Y[40]", "tau.v", "tau.w"), ISB=FALSE)
+
+```
+
+It is evident that the estimation of true parameters has been carried out approximately successfully. For missing values like Y[40], surrounded by actually observed data, the prediction converged more successfully than for observations like Y[689] which is influenced by the noise from previous estimations, considering the nature of the model and lack of data. The chains still converge though. This convergence is clear in the cases of priors as well. 
+
+Now, the scale-reduction factor is assessed via the Gelman-Rubin diagnostic. A factor of greater than 1 would suggest a notable difference between chains. 
+
+```{r}
+# The gelman rubin diagnostic
+#gr <- as.data.frame(gelman.diag(jagsfit.mcmc, multivariate=FALSE)$psrf)
+#gr
+```
+
+No systematic or significant increase over 1 is observed for the factor. Hence, it is concluded that the chains have converged and a suitable posterior distribution for parameters has been obtained. 
+
+## Validation
+
+Extracting the posterior means and 95% credible intervals for the estimated true underlying values $$\hat{Y}_{t}$$ - 
+
+```{r}
+tail(jags.mod.fit$BUGSoutput$summary[,1])
+```
+
+
+```{r}
+
+# Means and 2.5%, 97.5% standard deviations 
+y.1 <- jags.mod.fit$BUGSoutput$summary[1:1460,1]
+l.y.1 <- jags.mod.fit$BUGSoutput$summary[1:1460,3]
+h.y.1 <- jags.mod.fit$BUGSoutput$summary[1:1460,7]
+
+# Creating a dataframe
+df_1 <- data.frame(mean=y.1, LCI = l.y.1, HCI =h.y.1, time = data1[2:1461,2])
+
+# Plotting the results
+ggplot(data=df_1)+
+  geom_line(aes(x=time, y=mean, group=1), colour='red', size=0.5)+
+  geom_line(aes(x=time, y=LCI, group=1), colour="blue",size=0.5)+
+  geom_line(aes(x=time, y=HCI, group=1), colour="green",size=0.5)+
+   geom_point(aes(x=time, y=data1$Bexley[2:1461]), colour="black", size=0.3)+
+   theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(1) - PM10 in Bexley") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+The black points correspond to the orignal data. Clearly,all the observed points lie within the 95% credible interval except in two cases throughout the 3 year period (2000-2003). However, the width of this interval during the most period of a huge number of missing data in 2001 is very wide. This is expected since the nature of the model is such that the uncertainty and lack of confidence in prediction of 'previous' values carries over to the 'current' predictions. This consideration of the white noise process in addition to the measurement error makes the intervals much wider in Bayesian modelling processes. 
+
+## Alternative model
+
+Building an alternative random walk model of process of order 2, RW(2)
+
+$$Bexley_{t} \sim N(Y_{t}, \sigma_{v}^2)$$  
+$$Y_{t} \sim N(2Y_{t-1}-Y_{t-2}, \sigma_{w}^2)$$  
+
+The alterations made are as following - the formulation of distribution of underlying values is modified, and the second value of Y is additionally specified explicitly. Again, only data until the 31st of December, 2003 is used. 
+
+```{r}
+# The alternative model
+jags.mod.2 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+Y[2] ~ dnorm(0, 1.0E-3)
+for (i in 3 : N) {
+Bexley[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(2*Y[i-1]-Y[i-2], tau.w)
+}
+  # priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+jags.mod.fit.2 <- jags(data = jags.data, inits = jags.inits,
+parameters.to.save = jags.param, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.2,DIC=FALSE)
+```
+
+Like in previous RW(1) case, before performing inference on the distribution of parameters, convergence is tested. For consistency, traceplots for the same parameters will be extracted - 
+
+```{r}
+jagsfit.mcmc.2 <- as.mcmc(jags.mod.fit.2)
+MCMCtrace(jagsfit.mcmc.2,type = 'trace',ind = TRUE, pdf = FALSE, params=c( "Y[689]","Y[40]", "tau.v", "tau.w"), ISB=FALSE)
+```
+
+Two main points can be noted about these traceplots. Like in the case of previous model, the convergence is poorer for predictions of values like Y[689] surrounded mostly by missing data versus observed data. The convergence of chains for measurement error variance is evident, and did occur eventually for white noise variance. However, unlike in the previous model, the convergence of chains hasn't occurred for missing data in 2001. 
+
+Increasing the number of iterations might show that chains eventually converge, but this lack of convergence for these specific data is anticipated in the RW(2) model. Greater reliance on previous data points for current predictions is a crucial factor in the same. 
+
+```{r}
+# The gelman rubin diagnostic
+#gr.2 <- as.data.frame(gelman.diag(jagsfit.mcmc.2, multivariate=FALSE)$psrf)
+#gr.2
+```
+
+Regardless of poor convergence of 2001 missing data in the RW(2) model, the outcome for the first quarter of 2000 for both RW(1) and RW(2) models is plotted below. 
+
+```{r}
+# Values of RW(1) mean for the first quarter of 2000
+rw.1.2000 <- jags.mod.fit$BUGSoutput$summary[,1][-c(1461, 1462)][1:91]
+
+# Values of RW(2) mean for the first quarter of 2000
+rw.2.2000 <- jags.mod.fit.2$BUGSoutput$summary[,1][-c(1461, 1462)][1:91]
+
+# Creating a dataframe 
+df_2000 <- data.frame(time = data1[1:91,2], RW1 = rw.1.2000, RW2= rw.2.2000)
+
+# Plotting means from different models against time
+ggplot(data=df_2000)+
+  geom_line(mapping=aes(x=time, y=RW1, group=1), color='red')+
+  geom_line(mapping=aes(x=time, y=RW2, group=1), color='blue')+
+  theme(axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(1) and RW(2) PM10 estimations") +
+  xlab("Time (2012-2014)") + ylab("RW(1) - red, RW(2) - blue")
+```
+
+The RW(2) model is often applied in data-smoothing. As expected, the RW(2) model is much smoother than the RW(1) model. 
+
+## Prediction and testing
+
+Now, the RW(1) and RW(2) models are used to obtain the measurements of PM10 at Bexley for the first week of 2004. It is possible to predict estimates of the true underlying values of PM10 data by utilising a similar methodology as the one used for 'filling-in' missing data in previous application. 
+
+However, predictions can also be set up explicitly. Both methods are applied below, and shown to give similar results. First, modelling the predictions explicitly - 
+
+```{r}
+jags.mod.10 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+for (i in 2 : N) {
+Bexley[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(Y[i-1], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+
+# predictions
+Bexley.1461 ~ dnorm(Y.1461, tau.v)
+Y.1461 ~ dnorm(Y[1460], tau.w)
+Bexley.1462 ~ dnorm(Y.1462, tau.v)
+Y.1462 ~ dnorm(Y.1461, tau.w)
+Bexley.1463 ~ dnorm(Y.1463, tau.v)
+Y.1463 ~ dnorm(Y.1462, tau.w)
+Bexley.1464 ~ dnorm(Y.1464, tau.v)
+Y.1464 ~ dnorm(Y.1463, tau.w)
+Bexley.1465 ~ dnorm(Y.1465, tau.v)
+Y.1465 ~ dnorm(Y.1464, tau.w)
+Bexley.1466 ~ dnorm(Y.1466, tau.v)
+Y.1466 ~ dnorm(Y.1465, tau.w)
+Bexley.1467 ~ dnorm(Y.1467, tau.v)
+Y.1467 ~ dnorm(Y.1466, tau.w)
+}
+
+# The data
+jags.data <- list('Bexley', 'N')
+
+# Parameters to monitor
+jags.param.10 <- c('Bexley.1461', "Bexley.1462", "Bexley.1463", "Bexley.1464", "Bexley.1465", "Bexley.1466", "Bexley.1467")
+
+# Specifying initial values
+inits1.10 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Bexley'=bex.init1_re, "Y.1461" = runif(1, 18, 22), "Y.1462" = runif(1, 18, 22), "Y.1463" = runif(1, 18, 22), "Y.1464" = runif(1, 18, 22), "Y.1465" = runif(1, 18, 22), "Y.1466" = runif(1, 18, 22), "Y.1467" = runif(1, 18, 22))
+inits2.10 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Bexley'=bex.init2_re, "Y.1461" = runif(1, 18.5, 22.5), "Y.1462" = runif(1, 18.5, 22.5), "Y.1463" = runif(1, 18.5, 22.5), "Y.1464" = runif(1, 18.5, 22.5), "Y.1465" = runif(1, 18.5, 22.5), "Y.1466" = runif(1, 18.5, 22.5), "Y.1467" = runif(1, 18.5, 22.5))
+
+jags.inits.10 <- list(inits1.10, inits2.10)
+
+# Fitting the model
+jags.mod.fit.10 <- jags(data = jags.data, inits = jags.inits.10,
+parameters.to.save = jags.param.10, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.10,DIC=FALSE)
+```
+
+As usual, checking for convergence of the prediction parameters (Displaying traceplots for first and last days of the first week of 2004) - 
+
+```{r}
+# Checking to see if the RW(1) for the first week of 2004 has converged - 
+jagsfit.mcmc.10 <- as.mcmc(jags.mod.fit.10)
+MCMCtrace(jagsfit.mcmc.10,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Bexley.1461', "Bexley.1467"), ISB=FALSE)
+```
+
+All parameters appear to have converged. 
+
+Now, predicting PM10 values using the RW(2) model - 
+
+```{r}
+# Model to predict the means for pollution data in the first week of 2004
+jags.mod.11 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+Y[2] ~ dnorm(0, 1.0E-3)
+for (i in 3 : N) {
+Bexley[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(2*Y[i-1]-Y[i-2], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+
+# predictions
+Bexley.1461 ~ dnorm(Y.1461, tau.v)
+Y.1461 ~ dnorm(2*Y[1460]-Y[1459], tau.w)
+Bexley.1462 ~ dnorm(Y.1462, tau.v)
+Y.1462 ~ dnorm(2*Y.1461-Y[1460], tau.w)
+Bexley.1463 ~ dnorm(Y.1463, tau.v)
+Y.1463 ~ dnorm(2*Y.1462-Y.1461, tau.w)
+Bexley.1464 ~ dnorm(Y.1464, tau.v)
+Y.1464 ~ dnorm(2*Y.1463-Y.1462, tau.w)
+Bexley.1465 ~ dnorm(Y.1465, tau.v)
+Y.1465 ~ dnorm(2*Y.1464-Y.1463, tau.w)
+Bexley.1466 ~ dnorm(Y.1466, tau.v)
+Y.1466 ~ dnorm(2*Y.1465-Y.1464, tau.w)
+Bexley.1467 ~ dnorm(Y.1467, tau.v)
+Y.1467 ~ dnorm(2*Y.1466-Y.1465, tau.w)
+}
+
+# The data
+jags.data <- list('Bexley', 'N')
+
+# Parameters to monitor
+jags.param.11 <- c('Bexley.1461', "Bexley.1462", "Bexley.1463", "Bexley.1464", "Bexley.1465", "Bexley.1466", "Bexley.1467")
+
+# Specifying initial values
+inits1.11 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Bexley'=bex.init1_re, "Y.1461" = runif(1, 18, 22), "Y.1462" = runif(1, 18, 22), "Y.1463" = runif(1, 18, 22), "Y.1464" = runif(1, 18, 22), "Y.1465" = runif(1, 18, 22), "Y.1466" = runif(1, 18, 22), "Y.1467" = runif(1, 18, 22))
+inits2.11 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Bexley'=bex.init2_re, "Y.1461" = runif(1, 18.5, 22.5), "Y.1462" = runif(1, 18.5, 22.5), "Y.1463" = runif(1, 18.5, 22.5), "Y.1464" = runif(1, 18.5, 22.5), "Y.1465" = runif(1, 18.5, 22.5), "Y.1466" = runif(1, 18.5, 22.5), "Y.1467" = runif(1, 18.5, 22.5))
+
+jags.inits.11 <- list(inits1.11, inits2.11)
+
+# Fitting the model
+jags.mod.fit.11 <- jags(data = jags.data, inits = jags.inits.11,
+parameters.to.save = jags.param.11, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.11,DIC=FALSE)
+```
+
+Checking again for convergence of the prediction parameters (Displaying traceplots for first and last days of the first week of 2004) - 
+
+```{r}
+# Checking to see if the RW(1) for the first week of 2004 has converged - 
+jagsfit.mcmc.11 <- as.mcmc(jags.mod.fit.11)
+MCMCtrace(jagsfit.mcmc.11,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Bexley.1461', "Bexley.1467"), ISB=FALSE)
+```
+
+In prediction, the chains for RW(2) appear to have converged. 
+
+
+Using the second method, i.e., setting up prediction as missing data. 
+
+First, the dataset to be input into the RW(1) JAGS model is modified to include NAs for further 7 days. These NAs will be automatically estimated in R and will form predictions for the first week of 2004. 
+
+```{r}
+# Modified dataset for RW(1) model 
+rw1 <- Bexley
+rw1.1 <- append(rw1, rep(NA,7), after=length(rw1))
+
+Bexley_1_new <- rw1.1
+N_new <- length(Bexley_1_new)
+
+```
+
+Now that the modified dataset has been created, new initialisation vectors are created. Because the NAs in the first week are stochastic variables that will be predicted, they need to be initialised as well. As previously, the mean and median of the PM10 values will be taken as the initial values. 
+
+```{r}
+# Using mean to initialise 'missing' pollution data
+bex.new.init1 <- Bexley_1_new
+bex.new.init1[is.na(bex.new.init1)] <- mean(Bexley_1_new, na.rm=TRUE)
+
+
+bex.new.init1[bex.new.init1!=mean(bex.new.init1, na.rm=TRUE)] <- NA
+
+# Using median to initialise missing pollution data
+bex.new.init2 <- Bexley_1_new
+bex.new.init2[is.na(bex.new.init2)] <- median(bex.new.init2, na.rm=TRUE)
+
+
+bex.new.init2[bex.new.init2!=median(bex.new.init2, na.rm=TRUE)] <- NA
+
+
+# corrections
+bex.new.init2[32] <- NA
+bex.new.init2[253] <- NA
+bex.new.init2[258] <- NA
+bex.new.init2[326] <- NA
+bex.new.init2[475] <- NA
+bex.new.init2[748] <- NA
+bex.new.init2[752] <- NA
+bex.new.init2[923] <- NA
+bex.new.init2[1237] <- NA
+```
+
+Finally, predicting the measurements of PM10 at Bexley for the first week of 2004. 
+
+```{r}
+library(R2jags)
+library(coda)
+library(lattice)
+library(MCMCvis)
+library(tidyverse)
+
+# Model to predict the means for pollution data in the first week of 2004
+jags.mod.3 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+for (i in 2 : N_new) {
+Bexley_1_new[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(Y[i-1], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.3 <- list('Bexley_1_new', 'N_new')
+
+# Parameters to monitor
+jags.param.3 <- c('Bexley_1_new')
+
+# Specifying initial values
+inits1.3 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1467, 18, 22), 'Bexley_1_new'=bex.new.init1)
+inits2.3 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1467, 18.5, 22.5), 'Bexley_1_new'=bex.new.init2)
+
+jags.inits.3 <- list(inits1.3, inits2.3)
+
+# Fitting the model
+jags.mod.fit.3 <- jags(data = jags.data.3, inits = jags.inits.3,
+parameters.to.save = jags.param.3, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.3,DIC=FALSE)
+```
+
+
+```{r}
+# Checking to see if the RW(1) for the first week of 2004 has converged - 
+jagsfit.mcmc.3 <- as.mcmc(jags.mod.fit.3)
+MCMCtrace(jagsfit.mcmc.3,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Bexley_1_new[1461]', "Bexley_1_new[1467]"), ISB=FALSE)
+```
+
+
+```{r}
+# The gelman rubin diagnostic for RW(1) will go here. 
+#gr.3 <- as.data.frame(gelman.diag(jagsfit.mcmc.6, multivariate=FALSE)$psrf)
+#gr.3
+```
+
+Now, predicting PM10 measurements using the RW(2) model - 
+
+```{r}
+library(R2jags)
+library(coda)
+library(lattice)
+library(MCMCvis)
+library(tidyverse)
+
+# Model to predict the means for pollution data in the first week of 2004
+jags.mod.4 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+Y[2] ~ dnorm(0, 1.0E-3)
+for (i in 3 : N_new) {
+Bexley_1_new[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(2*Y[i-1]-Y[i-2], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.4 <- list('Bexley_1_new', 'N_new')
+
+# Parameters to monitor
+jags.param.4 <- c('Bexley_1_new')
+
+# Specifying initial values
+inits1.4 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1467, 18, 22), 'Bexley_1_new'=bex.new.init1)
+inits2.4 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1467, 18.5, 22.5), 'Bexley_1_new'=bex.new.init2)
+
+jags.inits.4 <- list(inits1.4, inits2.4)
+
+# Fitting the model
+jags.mod.fit.4 <- jags(data = jags.data.4, inits = jags.inits.4,
+parameters.to.save = jags.param.4, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.4,DIC=FALSE)
+```
+
+```{r}
+# Checking to see if the model has converged
+jagsfit.mcmc.4 <- as.mcmc(jags.mod.fit.4)
+MCMCtrace(jagsfit.mcmc.4,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Bexley_1_new[1461]', "Bexley_1_new[1467]" ), ISB=FALSE)
+```
+
+```{r}
+# The gelman rubin diagnostic will go here
+#gr.4 <- as.data.frame(gelman.diag(jagsfit.mcmc.4, multivariate=FALSE)$psrf)
+#gr.4
+
+```
+
+In this case, the PM10 predictions for the RW(2) model have converged as well. Because the posterior distribution appears to have been reached, means of these distributions can be extracted as averaged estimates for PM10 values in the first week of 2004 in Bexley. 
+
+```{r}
+# Predicted values according to the RW(1) model - 
+jags.mod.fit.10$BUGSoutput$summary[,1]
+
+# Predicted values according to the RW(2) model - 
+jags.mod.fit.11$BUGSoutput$summary[,1]
+```
+
+
+
+## Validation of results
+
+Plotting the predicted values of PM10 for the first week of 2004, along with the actual measurements against time - 
+
+```{r}
+# Creating a dataframe of predicted and actual PM10 observations for the first week of 2004
+
+df <- data.frame(actual = data1$Bexley[1462:1468], RW1 = jags.mod.fit.10$BUGSoutput$summary[,1], RW2 = jags.mod.fit.11$BUGSoutput$summary[,1], time = data1[1462:1468,2])
+df
+
+ggplot(data=df)+
+  geom_line(mapping=aes(x=time, y=actual, group=1), color='red')+
+  geom_line(mapping=aes(x=time, y=RW1, group=1), color='blue')+
+  geom_line(mapping=aes(x=time, y=RW2, group=1), color='green')+
+  theme(axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+
+
+```
+
+Re-running the models to calculate the root mean squared prediction error across all values in the first week of 2004. 
+
+First, creating a vector consisting of original measurements taken during the first week - 
+
+```{r}
+
+# Observed pollution data for week 1 in 2004
+actual_week <- data1[1462:1468,3]
+```
+
+Next, an extra node is added to the model to monitor the squared errors between estimated PM10 values and actual measurements. This process is repeated for both RW(1) and RW(2) models. For visualisation of relative error distribution and magnitude, these squared errors for each day of the first week are then plotted against time. 
+
+```{r}
+# Adding an extra line for calculating the root mean squared error for RW(1)
+
+jags.mod.5 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+for (i in 2 : N_new) {
+Bexley_1_new[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(Y[i-1], tau.w)
+}
+for (i in 1461:N_new){
+  sq.error[i] <- pow(Y[i]-actual_week[i-1460], 2)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+
+# The data
+jags.data.5 <- list('Bexley_1_new', 'N_new', 'actual_week')
+
+# Parameters to monitor
+jags.param.5 <- c('sq.error')
+
+# Specifying initial values
+inits1.3 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1467, 18, 22), 'Bexley_1_new'=bex.new.init1)
+inits2.3 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1467, 18.5, 22.5), 'Bexley_1_new'=bex.new.init2)
+
+jags.inits.5 <- list(inits1.3, inits2.3)
+
+# Fitting the model
+jags.mod.fit.5 <- jags(data = jags.data.5, inits = jags.inits.5,
+parameters.to.save = jags.param.5, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.5,DIC=FALSE)
+```
+
+
+Calculating RMSE for the RW(2) model - 
+
+```{r}
+# Adding an extra line for calculating the root mean squared error for RW(2)
+
+jags.mod.12 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+Y[2] ~ dnorm(0, 1.0E-3)
+for (i in 3 : N_new) {
+Bexley_1_new[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(2*Y[i-1]-Y[i-2], tau.w)
+}
+
+for (i in 1461:N_new){
+  sq.error[i] <- pow(Y[i]-actual_week[i-1460], 2)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.12 <- list('Bexley_1_new', 'N_new', 'actual_week')
+
+# Parameters to monitor
+jags.param.12 <- c('sq.error')
+
+# Specifying initial values
+inits1.12 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1467, 18, 22), 'Bexley_1_new'=bex.new.init1)
+inits2.12 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1467, 18.5, 22.5), 'Bexley_1_new'=bex.new.init2)
+
+jags.inits.12 <- list(inits1.12, inits2.12)
+
+# Fitting the model
+jags.mod.fit.12 <- jags(data = jags.data.12, inits = jags.inits.12,
+parameters.to.save = jags.param.12, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.12,DIC=FALSE)
+```
+
+Plotting the squared errors and their associated uncertainties for both RW(1) and RW(2) models - 
+
+```{r}
+# Means and 2.5%, 97.5% standard deviations 
+sq.1 <- jags.mod.fit.5$BUGSoutput$summary[,1]
+l.sq.1 <- jags.mod.fit.5$BUGSoutput$summary[,3]
+h.sq.1 <- jags.mod.fit.5$BUGSoutput$summary[,7]
+
+# Creating a dataframe
+sq_df_1 <- data.frame(mean=sq.1, LCI = l.sq.1, HCI =h.sq.1, time = data1[1462:1468,2])
+
+# Means and 2.5%, 97.5% standard deviations 
+sq.2 <- jags.mod.fit.12$BUGSoutput$summary[,1]
+l.sq.2 <- jags.mod.fit.12$BUGSoutput$summary[,3]
+h.sq.2 <- jags.mod.fit.12$BUGSoutput$summary[,7]
+
+# Creating a dataframe
+sq_df_2 <- data.frame(mean=sq.2, LCI = l.sq.2, HCI =h.sq.2, time = data1[1462:1468,2])
+
+ggplot()+
+  geom_line(data=sq_df_1,aes(x=time, y=mean, group=1), colour='red', size=0.5)+
+  geom_line(data=sq_df_1,aes(x=time, y=LCI, group=1), colour="blue",size=0.5)+
+  geom_line(data=sq_df_1,aes(x=time, y=HCI, group=1), colour="green",size=0.5)+
+  geom_line(data=sq_df_2,aes(x=time, y=mean, group=1), linetype=2, colour='red', size=0.5)+
+  geom_line(data=sq_df_2,aes(x=time, y=LCI, group=1),  linetype=2,colour="blue",size=0.5)+
+  geom_line(data=sq_df_2,aes(x=time, y=HCI, group=1),  linetype=2,colour="green",size=0.5)+
+  theme(panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+  
+```
+
+The solid line displays the 2.5% (blue), mean (red), and 97.5% (green) PM10 values for RW(1) model. The dashed line displays the same information for the RW(2) model. Clearly, overall the squared errors for RW(2) model are lower than RW(1). 
+
+The node in JAGS is monitored, and the mean from its posterior distribution is extracted to compute the root mean squared error. The RMSE for the RW(1) model is computed as follows - 
+
+```{r}
+# Computing the RMSE for RW(1)
+sqrt(mean(sq.1))
+```
+
+The RMSE for RW(1) model is computed to be approximately 13. 
+
+```{r}
+# Computing the RMSE for RW(2)
+sqrt(mean(sq.2))
+```
+
+As expected, the RMSE for RW(2) is 10.34, lower than for RW(1). 
+
+The trend of PM10 distribution was not reflected in the estimation of underlying PM10 values by either the RW(1) or RW(2) models. The RW(1) model forecasts a stagnant growth in PM10 values, whereas the RW(2) model predicts steadily increasing values. Both are not accurate, but overall the trend of increasing pollution values is captured by the RW(2) model. 
+
+## Alternative models
+
+Fitting the RW(1) and RW(2) models using uninformative priors for Hounslow - 
+
+First, preparing the data. 
+
+```{r}
+# Hounslow data prep
+dec13 <- data1[1:1461,]
+
+Houn.dat <- dec13$Hounslow
+Houn.dat_re <- Houn.dat[-1]
+Hounslow <- Houn.dat_re
+```
+
+Second, using the mean and median to initialise missing data. 
+
+```{r}
+# Using mean to initialise missing pollution data
+houn.init1 <- Houn.dat
+houn.init1[is.na(houn.init1)] <- mean(houn.init1, na.rm=TRUE)
+
+
+houn.init1[houn.init1!=mean(houn.init1, na.rm=TRUE)] <- NA
+#houn.init1
+
+houn.init1_re <- houn.init1[-1]
+
+# Using median to initialise missing pollution data
+houn.init2 <- Houn.dat
+houn.init2[is.na(houn.init2)] <- median(houn.init2, na.rm=TRUE)
+
+
+houn.init2[houn.init2!=median(houn.init2, na.rm=TRUE)] <- NA
+#houn.init2
+
+houn.init2_re <- houn.init2[-1]
+
+# corrections
+houn.init2_re[248] <- NA
+houn.init2_re[277] <- NA
+houn.init2_re[341] <- NA
+houn.init2_re[477] <- NA
+houn.init2_re[536] <- NA
+houn.init2_re[563] <- NA
+houn.init2_re[693] <- NA
+houn.init2_re[899] <- NA
+houn.init2_re[917] <- NA
+houn.init2_re[1307] <- NA
+houn.init2_re[1419] <- NA
+
+
+```
+
+Finally, fitting the RW(1) model - 
+
+```{r}
+y_init <- runif(1460, 18, 22)
+length(y_init)
+
+N_houn <- length(Hounslow)
+N_houn
+```
+
+JAGS model function as given - 
+
+```{r}
+library(R2jags)
+library(coda)
+library(lattice)
+library(MCMCvis)
+library(tidyverse)
+
+# JAGS model function 
+jags.mod.6 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+for (i in 2 : N_houn) {
+Hounslow[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(Y[i-1], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.6 <- list('Hounslow', 'N_houn')
+
+# Parameters to monitor
+jags.param.6 <- c('Y', 'tau.v', 'tau.w')
+
+# Specifying initial values
+inits1.6 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Hounslow'=houn.init1_re)
+inits2.6 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Hounslow'=houn.init2_re)
+
+jags.inits.6 <- list(inits1.6, inits2.6)
+
+# Fitting the model
+jags.mod.fit.6 <- jags(data = jags.data.6, inits = jags.inits.6,
+parameters.to.save = jags.param.6, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file=jags.mod.6, DIC=FALSE)
+```
+
+Checking for convergence:
+
+To keep consistent, the estimations of same parameters will be displayed in traceplots. Y[40], the prediction surrounded by actual measurements; Y[689], the prediction surrounded by other missing values; the white noise and measurement error variances. 
+
+```{r}
+jagsfit.mcmc.6 <- as.mcmc(jags.mod.fit.6)
+MCMCtrace(jagsfit.mcmc,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Y[40]', 'Y[689]', "tau.v", "tau.w"), ISB=FALSE)
+```
+
+The Gelman-Rubin diagnostic - 
+
+```{r}
+# The gelman rubin diagnostic
+#gr.6 <- as.data.frame(gelman.diag(jagsfit.mcmc.6, multivariate=FALSE)$psrf)
+#gr.6
+```
+
+Now fitting the RW(2) model to Hounslow data with uninformative priors - 
+
+```{r}
+# JAGS model function 
+jags.mod.7 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+Y[2] ~ dnorm(0, 1.0E-3)
+for (i in 3 : N_houn) {
+Hounslow[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(2*Y[i-1]-Y[i-2], tau.w)
+}
+# priors
+tau.w ~ dgamma(1,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(1,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.7 <- list('Hounslow', 'N_houn')
+
+# Parameters to monitor
+jags.param.7 <- c('Y', 'tau.v', 'tau.w')
+
+# Specifying initial values
+inits1.7 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Hounslow'=houn.init1_re)
+inits2.7 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Hounslow'=houn.init2_re)
+
+jags.inits.7 <- list(inits1.7, inits2.7)
+
+# Fitting the model
+jags.mod.fit.7 <- jags(data = jags.data.7, inits = jags.inits.7,
+parameters.to.save = jags.param.7, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.7,DIC=FALSE)
+```
+
+Checking for convergence - 
+
+```{r}
+jagsfit.mcmc.7 <- as.mcmc(jags.mod.fit.7)
+MCMCtrace(jagsfit.mcmc,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Y[40]', 'Y[689]', "tau.v", "tau.w"), ISB=FALSE)
+```
+
+The Gelman-Rubin diagnostic - 
+
+```{r}
+#gr.7 <- as.data.frame(gelman.diag(jagsfit.mcmc.7, multivariate=FALSE)$psrf)
+#gr.7
+```
+
+Commenting on how well both models fit the data by using plots for the first quarter of 2000. 
+
+```{r}
+# Values of RW(1) mean for the first quarter of 2000
+houn.rw.1.2000 <- jags.mod.fit.6$BUGSoutput$summary[,1][-c(1461, 1462)][1:91]
+
+# Values of RW(2) mean for the first quarter of 2000
+houn.rw.2.2000 <- jags.mod.fit.7$BUGSoutput$summary[,1][-c(1461, 1462)][1:91]
+
+# Creating a dataframe 
+houn.df_2000 <- data.frame(time = data1[1:91,2], RW1 = houn.rw.1.2000, RW2= houn.rw.2.2000, actual=data1$Hounslow[2:92])
+
+# Plotting means from different models against time
+ggplot(data=houn.df_2000)+
+  geom_line(mapping=aes(x=time, y=RW1, group=1), color='red')+
+  geom_line(mapping=aes(x=time, y=RW2, group=1), color='blue')+
+  geom_line(mapping=aes(x=time, y=actual, group=1), color='green')+
+   theme(axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(1), RW(2) - first quarter of 2000") +
+  xlab("Time (Jan-March, 2000)") + ylab("RW(1) - red, RW(2) - blue, original - green")
+
+```
+
+The green line joins the actual PM10 measurements, with missing segments for missing observations. The RW(1) model appears to simulate the erratic nature of PM10 trend much better than the RW(2) model. The latter is too smooth across time. 
+
+## Prediction and testing
+
+Running RW(1) and RW(2) analyses using informative priors - 
+
+The point estimates for priors are extracted from the models for Bexley data. Firstly, here are the point estimates in the case of RW(1) model.
+
+```{r}
+# Point estimate for tau.v
+jags.mod.fit$BUGSoutput$summary[1461,1]
+
+#Point estimate for tau.w
+jags.mod.fit$BUGSoutput$summary[1462,1]
+```
+
+Secondly, in the case of RW(2) model. 
+
+```{r}
+# Point estimate for tau.v
+jags.mod.fit.2$BUGSoutput$summary[1461, 1]
+
+#Point estimate for tau.w
+jags.mod.fit.2$BUGSoutput$summary[1462, 1]
+```
+
+Replacing the informative prior means with these point estimates respectively in the appropriate models - 
+
+Firstly, RW(1) model. 
+
+```{r}
+# JAGS model function 
+jags.mod.8 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+for (i in 2 : N_houn) {
+Hounslow[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(Y[i-1], tau.w)
+}
+# priors
+tau.w ~ dgamma(0.03046747,0.01)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(0.06744539,0.01)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.8 <- list('Hounslow', 'N_houn')
+
+# Parameters to monitor
+jags.param.8 <- c('Y', 'tau.v', 'tau.w')
+
+# Specifying initial values
+inits1.8 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Hounslow'=houn.init1_re)
+inits2.8 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Hounslow'=houn.init2_re)
+
+jags.inits.8 <- list(inits1.8, inits2.8)
+
+# Fitting the model
+jags.mod.fit.8 <- jags(data = jags.data.8, inits = jags.inits.8,
+parameters.to.save = jags.param.8, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file=jags.mod.8, DIC=FALSE)
+```
+
+Checking for convergence on the usual parameters - 
+
+```{r}
+jagsfit.mcmc.8 <- as.mcmc(jags.mod.fit.8)
+MCMCtrace(jagsfit.mcmc.8,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Y[40]', "Y[689]", "tau.v", "tau.w"), ISB=FALSE)
+```
+
+Clearly, convergence occurs but shows the same pattern of noisiness across parameters as observed in the case with uninformed priors. 
+
+The GR diagnostic - 
+
+```{r}
+#gr.8 <- as.data.frame(gelman.diag(jagsfit.mcmc.8, multivariate=FALSE)$psrf)
+#gr.8%>%
+  #filter(`Upper C.I.`>1.1)
+```
+
+For the RW(2) model - 
+
+```{r}
+# JAGS model function 
+jags.mod.9 <- function(){
+Y[1] ~ dnorm(0, 1.0E-3)
+Y[2] ~ dnorm(0, 1.0E-3)
+for (i in 3 : N_houn) {
+Hounslow[i] ~ dnorm(Y[i],tau.v)
+Y[i] ~ dnorm(2*Y[i-1]-Y[i-2], tau.w)
+}
+# priors
+tau.w ~ dgamma(2.182071,0.65)
+sigma.w2 <- 1/tau.w
+tau.v ~ dgamma(0.01933004,0.001)
+sigma.v2 <- 1/tau.v
+}
+
+# The data
+jags.data.9 <- list('Hounslow', 'N_houn')
+
+# Parameters to monitor
+jags.param.9 <- c('Y', 'tau.v', 'tau.w')
+
+# Specifying initial values
+inits1.9 <- list('tau.v'=1,'tau.w'=1, 'Y'=runif(1460, 18, 22), 'Hounslow'=houn.init1_re)
+inits2.9 <- list('tau.v'=2,'tau.w'=2, 'Y'=runif(1460, 18.5, 22.5), 'Hounslow'=houn.init2_re)
+
+jags.inits.9 <- list(inits1.9, inits2.9)
+
+# Fitting the model
+jags.mod.fit.9 <- jags(data = jags.data.9, inits = jags.inits.9,
+parameters.to.save = jags.param.9, n.chains = 2, n.iter = 8000,
+n.burnin = 4000,n.thin=1,model.file = jags.mod.9,DIC=FALSE)
+```
+
+Checking for convergence - 
+
+```{r}
+jagsfit.mcmc.9 <- as.mcmc(jags.mod.fit.9)
+MCMCtrace(jagsfit.mcmc.9,type = 'trace',ind = TRUE, pdf = FALSE, params=c('Y[40]', "Y[689]", "tau.v", "tau.w"), ISB=FALSE)
+```
+
+The GR diagnostic - 
+
+```{r}
+#gr.9 <- as.data.frame(gelman.diag(jagsfit.mcmc.9, multivariate=FALSE)$psrf)
+#gr.9
+```
+
+
+Despite using informed priors, the chains do not appear to have converged. 
+
+Finally, the results can be compared by plotting the posterior distributions - 
+
+```{r}
+# RW(1) and uninformed priors
+y.u <- jags.mod.fit.6$BUGSoutput$summary[1:1460,1]
+l.y.u <- jags.mod.fit.6$BUGSoutput$summary[1:1460,3]
+h.y.u <- jags.mod.fit.6$BUGSoutput$summary[1:1460,7]
+
+# RW(1) and informed priors 
+y.u.inf <- jags.mod.fit.8$BUGSoutput$summary[1:1460,1]
+l.y.u.inf <- jags.mod.fit.8$BUGSoutput$summary[1:1460,3]
+h.y.u.inf <- jags.mod.fit.8$BUGSoutput$summary[1:1460,7]
+
+# Creating a dataframe
+df_uninformed <- data.frame(mean=y.u, LCI = l.y.u, HCI =h.y.u, time = data1[2:1461,2])
+
+# Plotting the results for uninformed
+ggplot(data=df_uninformed)+
+  geom_line(aes(x=time, y=mean, group=1), colour='red', size=0.5)+
+  geom_line(aes(x=time, y=LCI, group=1), colour="blue",size=0.5)+
+  geom_line(aes(x=time, y=HCI, group=1), colour="green",size=0.5)+
+   theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(1), uninformed priors - PM10 in Bexley") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+```{r}
+library(ggplot2)
+# Creating a dataframe
+df_informed <- data.frame(mean=y.u.inf, LCI = l.y.u.inf, HCI =h.y.u.inf, time = data1[2:1461,2])
+
+# Plotting the results for uninformed
+ggplot(data=df_informed)+
+  geom_line(aes(x=time, y=mean, group=1), colour='red', size=0.5)+
+  geom_line(aes(x=time, y=LCI, group=1), colour="blue",size=0.5)+
+  geom_line(aes(x=time, y=HCI, group=1), colour="green",size=0.5)+
+   theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(1), informed priors - PM10 in Bexley") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+Using informed priors for the RW(1) model has contributed to wider uncertainty boundaries. 
+
+
+For RW(2) on the other hand - 
+
+```{r}
+# RW(2) and uninformed priors
+y.u_2 <- jags.mod.fit.7$BUGSoutput$summary[1:1460,1]
+l.y.u_2 <- jags.mod.fit.7$BUGSoutput$summary[1:1460,3]
+h.y.u_2 <- jags.mod.fit.7$BUGSoutput$summary[1:1460,7]
+
+# RW(2) and informed priors 
+y.u.inf_2 <- jags.mod.fit.9$BUGSoutput$summary[1:1460,1]
+l.y.u.inf_2 <- jags.mod.fit.9$BUGSoutput$summary[1:1460,3]
+h.y.u.inf_2 <- jags.mod.fit.9$BUGSoutput$summary[1:1460,7]
+
+# Creating a dataframe
+df_uninformed_2 <- data.frame(mean=y.u_2, LCI = l.y.u_2, HCI =h.y.u_2, time = data1[2:1461,2])
+
+# Plotting the results for uninformed
+ggplot(data=df_uninformed_2)+
+  geom_line(aes(x=time, y=mean, group=1), colour='red', size=0.5)+
+  geom_line(aes(x=time, y=LCI, group=1), colour="blue",size=0.5)+
+  geom_line(aes(x=time, y=HCI, group=1), colour="green",size=0.5)+
+   theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(2), uninformed priors - PM10 in Bexley") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+Finally, using informed priors - 
+
+```{r}
+
+# Creating a dataframe
+df_informed_2 <- data.frame(mean=y.u.inf_2, LCI = l.y.u.inf_2, HCI =h.y.u.inf_2, time = data1[2:1461,2])
+
+# Plotting the results for uninformed
+ggplot(data=df_informed_2)+
+  geom_line(aes(x=time, y=mean, group=1), colour='red', size=0.5)+
+  geom_line(aes(x=time, y=LCI, group=1), colour="blue",size=0.5)+
+  geom_line(aes(x=time, y=HCI, group=1), colour="green",size=0.5)+
+   theme(legend.title = element_blank(), 
+        axis.text.x = element_blank(), 
+        axis.ticks = element_blank(), 
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), 
+        plot.title = element_text(face="bold", hjust=0.5))+
+  ggtitle("RW(2), informed priors - PM10 in Bexley") +
+  xlab("Time (2012-2014)") + ylab("PM10")
+```
+
+## Final decision
+
+Although the difference is not great, confidence intervals have also become wider in the case of using informed priors with RW(2) model. 
